@@ -1,5 +1,10 @@
 {
   "RAINYUN_API_KEY": "",
   "HMC_EMAIL": "",
-  "HMC_PASSWORD": ""
+  "HMC_PASSWORD": "",
+  "BARK_URL": "",
+  "SERVERCHAN_KEY": "",
+  "PUSHPLUS_TOKEN": "",
+  "TELEGRAM_BOT_TOKEN": "",
+  "TELEGRAM_CHAT_ID": ""
 }

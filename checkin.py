@@ -3,44 +3,59 @@
 """
 雨云 + 海绵科创 双平台自动签到
 ================================
-- 雨云(Rainyun)  : 调用官方 API 完成「每日签到」积分任务
+- 雨云(Rainyun)  : 自动完成腾讯 TCaptcha 点选验证码(模板匹配, 无需打码服务)后签到
 - 海绵科创(YunMC) : 邮箱密码登录后调用积分商城签到接口
+- 结果推送        : 支持 Bark / Server酱 / PushPlus / Telegram, 配了哪个发哪个
 
 凭据配置(二选一, 环境变量优先):
   1. 环境变量:
        RAINYUN_API_KEY   雨云 API Key, 多账号用英文逗号分隔
        HMC_EMAIL         海绵科创邮箱, 多账号用英文逗号分隔
        HMC_PASSWORD      海绵科创密码, 与邮箱一一对应, 逗号分隔
+     推送(全部可选, 配了哪个渠道就发哪个):
+       BARK_URL          Bark 完整推送地址, 如 https://api.day.app/xxxx
+       SERVERCHAN_KEY    Server酱 SendKey
+       PUSHPLUS_TOKEN    PushPlus token
+       TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  两个都配才发
   2. config.json(参考 config.example.json)
 
 用法:
-  python checkin.py                # 全部平台签到
-  python checkin.py --platform rainyun   # 只签雨云
-  python checkin.py --platform hmc      # 只签海绵科创
+  python checkin.py                     # 全部平台签到
+  python checkin.py --platform rainyun  # 只签雨云
+  python checkin.py --platform hmc     # 只签海绵科创
+  python checkin.py --no-notify        # 本次不推送
 
 退出码: 0 = 全部成功/跳过, 1 = 存在失败(便于 CI 标红)
+
+验证码识别模块来自 RainyunCheckIn(https://github.com/FalseHappiness/RainyunCheckIn), MIT License。
 """
 
 import argparse
 import json
 import os
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
     import requests
 except ImportError:
-    print("缺少依赖 requests, 请先执行: pip install requests", file=sys.stderr)
+    print("缺少依赖 requests, 请先执行: pip install -r requirements.txt", file=sys.stderr)
     sys.exit(1)
 
 TIMEOUT = 30
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 
 # 平台签到结果状态
 OK = "成功"
 SKIP = "跳过"      # 今日已签到
 FAIL = "失败"
+
+ALL_CONFIG_KEYS = [
+    "RAINYUN_API_KEY", "HMC_EMAIL", "HMC_PASSWORD",
+    "BARK_URL", "SERVERCHAN_KEY", "PUSHPLUS_TOKEN",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+]
 
 
 @dataclass
@@ -49,18 +64,18 @@ class SignResult:
     account: str
     status: str = FAIL
     message: str = ""
-    raw: str = field(default="", repr=False)
 
 
 def load_config() -> dict:
-    """读取 config.json, 环境变量同名配置优先生效。"""
-    cfg = {"RAINYUN_API_KEY": "", "HMC_EMAIL": "", "HMC_PASSWORD": ""}
+    """读取 config.json, 同名环境变量优先。"""
+    cfg = {k: "" for k in ALL_CONFIG_KEYS}
 
     config_path = Path(__file__).parent / "config.json"
     if config_path.exists():
         try:
             file_cfg = json.loads(config_path.read_text(encoding="utf-8"))
-            cfg.update({k: v for k, v in file_cfg.items() if isinstance(v, str)})
+            cfg.update({k: v for k, v in file_cfg.items()
+                        if k in cfg and isinstance(v, str)})
         except (json.JSONDecodeError, OSError) as e:
             print(f"⚠️ config.json 解析失败: {e}", file=sys.stderr)
 
@@ -71,80 +86,53 @@ def load_config() -> dict:
     return cfg
 
 
-# ---------------------------------------------------------------- 雨云
-
-RAINYUN_API = "https://api.v2.rainyun.com"
-
+# ---------------------------------------------------------------- 雨云(含验证码自动识别)
 
 def rainyun_sign(api_key: str) -> SignResult:
-    """雨云每日签到。POST /user/reward/tasks 提交积分任务。"""
+    """雨云每日签到: 自动过 TCaptcha 点选验证码 -> 提交积分任务。"""
     account = api_key[:6] + "****" if len(api_key) > 6 else "****"
     result = SignResult(platform="雨云", account=account)
-    headers = {
-        "x-api-key": api_key,
-        "Content-Type": "application/json",
-        "User-Agent": UA,
-    }
 
     try:
-        # 先查询任务状态: 未签则签到, 已签则跳过
-        resp = requests.get(
-            f"{RAINYUN_API}/user/reward/tasks",
-            headers=headers, timeout=TIMEOUT,
-        )
-        result.raw = resp.text[:500]
+        # 延迟加载验证码模块(依赖 opencv/mini-racer, 不签雨云时无需加载)
+        from src.main import MainLogic
 
-        if resp.status_code == 401:
-            result.message = "API Key 无效或已过期"
-            return result
+        # 凭据写入临时配置文件(Cookie 会回写该文件, 不污染工作目录)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        ) as f:
+            json.dump({"auth": {"x-api-key": api_key, "name": account}}, f)
+            config_path = f.name
 
-        signed_today = False
-        if resp.ok:
-            try:
-                tasks = resp.json().get("data") or []
-                for t in tasks:
-                    if t.get("task_name") == "每日签到":
-                        # done/completed 字段名以实际返回为准, 均做兼容
-                        signed_today = bool(t.get("done") or t.get("completed")
-                                            or t.get("is_complete"))
-                        break
-            except (ValueError, AttributeError, TypeError):
-                pass
+        logic = MainLogic(config_path=config_path)
+        raw = logic.auto_check_in(match_method="template")
 
-        if signed_today:
-            result.status = SKIP
-            result.message = "今日已签到"
-            return result
+        # 解析结果: 已签到 -> {'error': '...今日已经签到。'}
+        #          签到响应 -> 雨云 API 原始 JSON {'code':..,'message':..}
+        #          过程失败 -> {'error': '...'}
+        if isinstance(raw, dict) and "data" in raw and isinstance(raw["data"], list):
+            raw = raw["data"][0] if raw["data"] else {"error": "无返回数据"}
 
-        # 提交签到任务
-        resp = requests.post(
-            f"{RAINYUN_API}/user/reward/tasks",
-            headers=headers,
-            json={"task_name": "每日签到"},
-            timeout=TIMEOUT,
-        )
-        result.raw = resp.text[:500]
-        body = {}
-        try:
-            body = resp.json()
-        except ValueError:
-            pass
-
-        msg = str(body.get("message") or body.get("msg") or result.raw)
-        code = body.get("code", resp.status_code)
-
-        if resp.ok and (code in (0, 200) or "成功" in msg):
-            result.status = OK
-            result.message = msg
-        elif "已签到" in msg or "重复" in msg or "未达成条件" in msg:
-            # "未达成条件" = 当日已领过该任务
-            result.status = SKIP
-            result.message = msg
+        if not isinstance(raw, dict):
+            result.message = str(raw)
+        elif raw.get("error"):
+            err = str(raw["error"])
+            if "已经签到" in err or "已签到" in err:
+                result.status = SKIP
+            result.message = err
         else:
-            result.message = f"HTTP {resp.status_code}: {msg}"
+            msg = str(raw.get("message") or raw.get("msg") or "")
+            code = raw.get("code")
+            if code in (0, 200) or "成功" in msg or "完成" in msg:
+                result.status = OK
+                result.message = msg or "签到成功"
+            else:
+                result.message = f"code={code} {msg}"[:200]
 
-    except requests.RequestException as e:
-        result.message = f"网络错误: {e}"
+    except ImportError as e:
+        result.message = f"验证码模块加载失败, 请安装依赖: pip install -r requirements.txt ({e})"
+    except Exception as e:
+        result.message = f"{type(e).__name__}: {e}"[:200]
     return result
 
 
@@ -158,7 +146,10 @@ def hmc_sign(email: str, password: str) -> SignResult:
     """海绵科创(海绵联机)签到: 登录 -> 积分商城签到。"""
     result = SignResult(platform="海绵科创", account=email)
     session = requests.Session()
-    session.headers.update({"User-Agent": UA})
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    })
 
     try:
         # 1. 邮箱密码登录
@@ -180,8 +171,6 @@ def hmc_sign(email: str, password: str) -> SignResult:
             headers={"x-requested-with": "XMLHttpRequest"},
             timeout=TIMEOUT,
         )
-        result.raw = resp.text[:500]
-
         try:
             body = resp.json()
         except ValueError:
@@ -197,8 +186,8 @@ def hmc_sign(email: str, password: str) -> SignResult:
         elif "已签到" in msg or "重复" in msg:
             result.status = SKIP
             result.message = msg
-        elif "登录" in msg or code in (0, -1) and not msg:
-            result.message = f"登录失败或会话过期: {msg or result.raw}"
+        elif "登录" in msg or (code in (0, -1) and not msg):
+            result.message = f"登录失败或会话过期: {msg or resp.text[:120]}"
         else:
             result.message = msg or f"code={code}"
 
@@ -207,13 +196,73 @@ def hmc_sign(email: str, password: str) -> SignResult:
     return result
 
 
+# ---------------------------------------------------------------- 消息推送
+
+def notify(cfg: dict, title: str, content: str) -> None:
+    """尽力而为推送: 配了哪个渠道就发哪个, 单渠道失败不影响其他渠道和退出码。"""
+    attempts = []
+
+    # Bark
+    if cfg.get("BARK_URL"):
+        attempts.append(("Bark", lambda: requests.post(
+            cfg["BARK_URL"].rstrip("/"),
+            json={"title": title, "body": content, "group": "checkin"},
+            timeout=TIMEOUT,
+        )))
+
+    # Server酱
+    if cfg.get("SERVERCHAN_KEY"):
+        attempts.append(("Server酱", lambda: requests.post(
+            f"https://sctapi.ftqq.com/{cfg['SERVERCHAN_KEY']}.send",
+            data={"title": title, "desp": content},
+            timeout=TIMEOUT,
+        )))
+
+    # PushPlus
+    if cfg.get("PUSHPLUS_TOKEN"):
+        attempts.append(("PushPlus", lambda: requests.post(
+            "https://www.pushplus.plus/send",
+            json={"token": cfg["PUSHPLUS_TOKEN"], "title": title,
+                  "content": content.replace("\n", "<br>")},
+            timeout=TIMEOUT,
+        )))
+
+    # Telegram
+    if cfg.get("TELEGRAM_BOT_TOKEN") and cfg.get("TELEGRAM_CHAT_ID"):
+        attempts.append(("Telegram", lambda: requests.post(
+            f"https://api.telegram.org/bot{cfg['TELEGRAM_BOT_TOKEN']}/sendMessage",
+            json={"chat_id": cfg["TELEGRAM_CHAT_ID"], "text": f"{title}\n\n{content}"},
+            timeout=TIMEOUT,
+        )))
+
+    if not attempts:
+        return
+
+    for name, send in attempts:
+        try:
+            resp = send()
+            ok = resp.ok
+            try:
+                body = resp.json()
+                # Telegram/PushPlus 用 ok 字段判断业务成功
+                if isinstance(body, dict) and "ok" in body:
+                    ok = ok and bool(body["ok"])
+                if isinstance(body, dict) and body.get("code") not in (None, 200):
+                    ok = False
+            except ValueError:
+                pass
+            print(f"  推送[{name}]: {'成功' if ok else '失败 ' + resp.text[:100]}")
+        except requests.RequestException as e:
+            print(f"  推送[{name}]: 失败 {e}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------- 主流程
 
 def split(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
-def run(cfg: dict, platforms: set[str]) -> int:
+def run(cfg: dict, platforms: set[str], do_notify: bool) -> int:
     results: list[SignResult] = []
 
     if "rainyun" in platforms:
@@ -221,6 +270,7 @@ def run(cfg: dict, platforms: set[str]) -> int:
         if not keys:
             print("⏭️  [雨云] 未配置 RAINYUN_API_KEY, 跳过")
         for key in keys:
+            print(f"🔐 [雨云] 正在签到(含验证码识别, 约需 10-30 秒)...")
             results.append(rainyun_sign(key))
 
     if "hmc" in platforms:
@@ -236,16 +286,25 @@ def run(cfg: dict, platforms: set[str]) -> int:
 
     # 汇总输出
     print("\n========== 签到结果汇总 ==========")
+    lines = []
     failed = 0
     for r in results:
         icon = {"成功": "✅", "跳过": "⏭️", "失败": "❌"}[r.status]
-        print(f"{icon} [{r.platform}] {r.account}: {r.status} — {r.message}")
+        line = f"{icon} [{r.platform}] {r.account}: {r.status} — {r.message}"
+        print(line)
+        lines.append(f"{icon} [{r.platform}] {r.account}: {r.status} — {r.message}")
         if r.status == FAIL:
             failed += 1
 
     if not results:
         print("(未执行任何签到, 请检查凭据配置)")
-    print(f"==================================")
+    print("==================================")
+
+    if do_notify and results:
+        print("\n📮 发送结果推送...")
+        icon = "❌" if failed else "✅"
+        notify(cfg, f"{icon} 每日签到{'有失败' if failed else '完成'}", "\n".join(lines))
+
     return 1 if failed else 0
 
 
@@ -257,11 +316,16 @@ def main() -> None:
         default="all",
         help="只签指定平台, 默认全部",
     )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="本次运行不发送结果推送",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
     platforms = {"rainyun", "hmc"} if args.platform == "all" else {args.platform}
-    sys.exit(run(cfg, platforms))
+    sys.exit(run(cfg, platforms, do_notify=not args.no_notify))
 
 
 if __name__ == "__main__":
