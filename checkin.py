@@ -183,7 +183,8 @@ def hmc_sign(email: str, password: str) -> SignResult:
         if code == 1:
             result.status = OK
             result.message = msg or "签到成功"
-        elif "已签到" in msg or "重复" in msg:
+        elif ("已" in msg and "签到" in msg) or "重复" in msg or "签过" in msg:
+            # 兼容各种"已签到/已经签到过了/重复签到"文案
             result.status = SKIP
             result.message = msg
         elif "登录" in msg or (code in (0, -1) and not msg):
@@ -236,6 +237,7 @@ def notify(cfg: dict, title: str, content: str) -> None:
         )))
 
     if not attempts:
+        print("  (未配置推送渠道, 如需通知请配置 BARK_URL / SERVERCHAN_KEY / PUSHPLUS_TOKEN / TELEGRAM)")
         return
 
     for name, send in attempts:

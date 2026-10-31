@@ -26,4 +26,9 @@ jobs:
           RAINYUN_API_KEY: ${{ secrets.RAINYUN_API_KEY }}
           HMC_EMAIL: ${{ secrets.HMC_EMAIL }}
           HMC_PASSWORD: ${{ secrets.HMC_PASSWORD }}
+          BARK_URL: ${{ secrets.BARK_URL }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python checkin.py
