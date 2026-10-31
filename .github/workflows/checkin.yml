@@ -1,0 +1,29 @@
+name: 每日签到
+
+on:
+  schedule:
+    # UTC 00:10 = 北京时间 08:10, 每天自动签到
+    - cron: '10 0 * * *'
+  workflow_dispatch: # 支持在 Actions 页面手动触发
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run check-in
+        env:
+          RAINYUN_API_KEY: ${{ secrets.RAINYUN_API_KEY }}
+          HMC_EMAIL: ${{ secrets.HMC_EMAIL }}
+          HMC_PASSWORD: ${{ secrets.HMC_PASSWORD }}
+        run: python checkin.py
